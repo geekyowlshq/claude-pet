@@ -1,0 +1,10 @@
+{
+  "name": "claude-pet",
+  "description": "A desktop pet that switches between your personal and work Claude accounts in a click, in Claude Code and the Claude desktop app. macOS.",
+  "version": "1.2.0",
+  "author": { "name": "GeekyOwls", "url": "https://geekyowls.com" },
+  "homepage": "https://github.com/geekyowlshq/claude-pet",
+  "repository": "https://github.com/geekyowlshq/claude-pet",
+  "license": "MIT",
+  "keywords": ["accounts", "switcher", "desktop-pet", "macos"]
+}

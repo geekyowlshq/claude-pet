@@ -1,0 +1,15 @@
+{
+  "name": "geekyowls",
+  "description": "Free, just-for-fun tools from GeekyOwls.",
+  "owner": {
+    "name": "GeekyOwls",
+    "url": "https://geekyowls.com"
+  },
+  "plugins": [
+    {
+      "name": "claude-pet",
+      "source": "./plugin",
+      "description": "A desktop pet that switches between your personal and work Claude accounts in a click (macOS)."
+    }
+  ]
+}

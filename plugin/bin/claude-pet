@@ -1,0 +1,479 @@
+#!/bin/bash
+# claude-pet — switch Claude accounts across Claude Code (CLI) and the Claude desktop app.
+# macOS. Bash 3.2 compatible (the bash macOS ships).
+set -eu
+
+VERSION="1.2.0"
+PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+
+OS_HOME="${CLAUDE_PET_HOME:-$HOME/Library/Application Support/ClaudePet}"
+PROFILES="$OS_HOME/profiles"
+DESKTOP_DATA="${CLAUDE_PET_DESKTOP_DATA:-$HOME/Library/Application Support/Claude}"
+DESKTOP_APP="${CLAUDE_PET_DESKTOP_APP:-Claude}"
+CLI_JSON="$HOME/.claude.json"
+CLI_CRED_FILE="$HOME/.claude/.credentials.json"
+KC_SERVICE="Claude Code-credentials"
+KC_PREFIX="ClaudePet cli: "
+ALL_SURFACES="cli desktop"
+JSON_JS="$OS_HOME/.jsonhelper.js"
+LOCK="$OS_HOME/.lock"
+
+log() { printf '%s\n' "$*" >&2; }
+die() { log "claude-pet: $*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+claude-pet — one-click Claude account switcher
+
+  claude-pet init <name>      Name the account you're logged into right now (first run)
+  claude-pet add <name>       Save current logins, sign out everywhere, log in to <name> next
+  claude-pet use <name>       Switch to <name>
+  claude-pet next             Switch to the next account (alphabetical, wraps)
+  claude-pet list             List accounts (* = current)
+  claude-pet current          Print the current account
+  claude-pet rename <old> <new>  Rename a saved account
+  claude-pet remove <name>    Delete a saved account (if it's the current one, switch to another first)
+  claude-pet install-pet      Build and launch the desktop pet (needs Xcode command line tools)
+  claude-pet self-update      Update to the latest release and rebuild the pet
+
+Options (before the command):
+  --only cli,desktop           Only switch these surfaces (default: both)
+
+Surfaces:
+  cli      Claude Code — login lives in the macOS Keychain + ~/.claude.json
+  desktop  Claude desktop app — quits it, swaps its data folder, relaunches it
+EOF
+}
+
+if [ "$(uname)" != "Darwin" ] && [ "${CLAUDE_PET_ALLOW_NONMAC:-0}" != 1 ]; then
+  die "Claude Pet works on macOS only for now. Windows and Linux support is planned."
+fi
+
+mkdir -p "$PROFILES"
+chmod 700 "$OS_HOME" 2>/dev/null || true
+
+# ---------- helpers ----------
+valid_name() {
+  case "$1" in
+    ''|.*|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  [ ${#1} -le 10 ]
+}
+get_state() { if [ -f "$OS_HOME/$1" ]; then cat "$OS_HOME/$1"; fi; }
+set_state() { printf '%s\n' "$2" > "$OS_HOME/$1"; }
+profile_exists() { [ -d "$PROFILES/$1" ]; }
+
+list_profiles() {
+  local d
+  for d in "$PROFILES"/*; do
+    if [ -d "$d" ]; then basename "$d"; fi
+  done | LC_ALL=C sort
+}
+
+acquire_lock() {
+  local i=0
+  until mkdir "$LOCK" 2>/dev/null; do
+    i=$((i + 1))
+    if [ $i -gt 40 ]; then die "another switch is running (delete \"$LOCK\" if it's stuck)"; fi
+    sleep 0.25
+  done
+  trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+}
+
+SURFACES=""
+has_surface() { case " $SURFACES " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# JSON editing via JavaScript for Automation (ships with macOS, no python needed)
+write_json_helper() {
+  cat > "$JSON_JS" <<'JXA'
+ObjC.import('Foundation');
+function exists(p) { return $.NSFileManager.defaultManager.fileExistsAtPath(p); }
+function readText(p) {
+  if (!exists(p)) return null;
+  return ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(p, $.NSUTF8StringEncoding, null));
+}
+function writeText(p, t) { $(t).writeToFileAtomicallyEncodingError(p, true, $.NSUTF8StringEncoding, null); }
+function run(argv) {
+  var op = argv[0], a = argv[1], b = argv[2];
+  if (op === 'get') {            // get <claude.json> <out>: copy oauthAccount out
+    var raw = readText(a); if (!raw) return '';
+    var obj = JSON.parse(raw);
+    if (obj.oauthAccount !== undefined) writeText(b, JSON.stringify(obj.oauthAccount));
+    return '';
+  }
+  if (op === 'set') {            // set <claude.json> <in>: put oauthAccount back (or remove it)
+    var raw2 = readText(a); if (!raw2) return '';
+    var obj2 = JSON.parse(raw2);
+    var v = readText(b);
+    if (v) obj2.oauthAccount = JSON.parse(v); else delete obj2.oauthAccount;
+    writeText(a, JSON.stringify(obj2, null, 2));
+    return '';
+  }
+  if (op === 'email') {          // email <account.json>
+    var r = readText(a); if (!r) return '';
+    try { return JSON.parse(r).emailAddress || ''; } catch (e) { return ''; }
+  }
+  if (op === 'desktopemail') {   // desktopemail <desktop data dir>
+    // The desktop app caches the signed-in account ({account: {..., email_address}}) in its
+    // IndexedDB. Only that field is read, never emails that appear in chats. Undocumented format:
+    // if it changes, this just finds nothing.
+    var fm = $.NSFileManager.defaultManager, root = a + '/IndexedDB';
+    var re = /account[\s\S]{0,400}?email_address"[\s\S]([^"\x00-\x1f]{3,254})/;
+    var ok = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+    var subs = ['https_claude.ai_0.indexeddb.blob', 'https_claude.ai_0.indexeddb.leveldb'];
+    for (var i = 0; i < subs.length; i++) {
+      var dir = root + '/' + subs[i], en = fm.enumeratorAtPath(dir), f;
+      if (!en || en.isNil()) continue;
+      while ((f = en.nextObject) && !f.isNil()) {
+        var p = dir + '/' + ObjC.unwrap(f), isDir = Ref();
+        if (!fm.fileExistsAtPathIsDirectory(p, isDir) || isDir[0]) continue;
+        var d = $.NSData.dataWithContentsOfFile(p);
+        if (!d || d.isNil()) continue;
+        var m = re.exec(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(d, $.NSISOLatin1StringEncoding)) || '');
+        if (m && ok.test(m[1])) return m[1];
+      }
+    }
+    return '';
+  }
+  return '';
+}
+JXA
+}
+json_op() { osascript -l JavaScript "$JSON_JS" "$@"; }
+
+# ---------- Keychain ----------
+kc_read()    { security find-generic-password -s "$1" -w 2>/dev/null; }
+kc_account() { security find-generic-password -s "$1" 2>/dev/null | sed -n 's/^ *"acct"<blob>="\(.*\)"$/\1/p' | head -n 1; }
+kc_write()   { security add-generic-password -U -a "$2" -s "$1" -w "$3" >/dev/null; }
+kc_delete()  { security delete-generic-password -s "$1" >/dev/null 2>&1 || true; }
+
+# ---------- surface: Claude Code CLI ----------
+cli_snapshot() {   # save the live CLI login into profile $1
+  local name="$1" d="$PROFILES/$1/cli" creds=""
+  mkdir -p "$d"
+  if creds=$(kc_read "$KC_SERVICE"); then :
+  elif [ -f "$CLI_CRED_FILE" ]; then creds=$(cat "$CLI_CRED_FILE")
+  else creds=""; fi
+  if [ -n "$creds" ]; then kc_write "$KC_PREFIX$name" "claude-pet" "$creds"; else kc_delete "$KC_PREFIX$name"; fi
+  rm -f "$d/account.json"
+  if [ -f "$CLI_JSON" ]; then json_op get "$CLI_JSON" "$d/account.json" >/dev/null 2>&1 || log "warning: couldn't read ~/.claude.json"; fi
+  return 0
+}
+
+cli_activate() {   # make profile $1 the live CLI login (blank if it has none)
+  local name="$1" d="$PROFILES/$1/cli" creds="" acct
+  mkdir -p "$d"
+  if creds=$(kc_read "$KC_PREFIX$name"); then :; else creds=""; fi
+  if [ -n "$creds" ]; then
+    acct=$(kc_account "$KC_SERVICE")
+    [ -n "$acct" ] || acct="${USER:-$(id -un)}"
+    kc_write "$KC_SERVICE" "$acct" "$creds"
+    if [ -f "$CLI_CRED_FILE" ]; then (umask 077; printf '%s' "$creds" > "$CLI_CRED_FILE"); fi
+  else
+    kc_delete "$KC_SERVICE"
+    rm -f "$CLI_CRED_FILE"
+  fi
+  if [ -f "$CLI_JSON" ]; then json_op set "$CLI_JSON" "$d/account.json" >/dev/null 2>&1 || log "warning: couldn't update ~/.claude.json"; fi
+  set_state current.cli "$name"
+}
+
+# ---------- surface: Claude desktop app ----------
+desktop_running() { pgrep -x "$DESKTOP_APP" >/dev/null 2>&1; }
+
+desktop_quit() {
+  desktop_running || return 0
+  osascript -e "tell application \"$DESKTOP_APP\" to quit" >/dev/null 2>&1 || true
+  local i=0
+  while desktop_running; do
+    i=$((i + 1))
+    if [ $i -gt 80 ]; then die "$DESKTOP_APP didn't quit — close it yourself and try again"; fi
+    sleep 0.25
+  done
+  i=0
+  while pgrep -f "/$DESKTOP_APP.app/Contents/" >/dev/null 2>&1; do
+    i=$((i + 1)); [ $i -gt 20 ] && break; sleep 0.25
+  done
+  sleep 0.5
+}
+
+desktop_activate() {   # $1 = target profile
+  local new="$1" old was_running=0 dst src
+  old=$(get_state current.desktop)
+  if [ "$new" = "$old" ]; then return 0; fi
+  if [ -z "$old" ] && [ -d "$DESKTOP_DATA" ]; then
+    die "desktop login isn't claimed by any account — run: claude-pet init <name>"
+  fi
+  if desktop_running; then was_running=1; fi
+  desktop_quit
+  if [ -d "$DESKTOP_DATA" ]; then
+    if [ -f "$DESKTOP_DATA/claude_desktop_config.json" ]; then
+      cp "$DESKTOP_DATA/claude_desktop_config.json" "$OS_HOME/shared_desktop_config.json"
+    fi
+    dst="$PROFILES/$old/desktop"
+    mkdir -p "$PROFILES/$old"
+    if [ -e "$dst" ]; then mv "$dst" "$dst.bak.$(date +%s)"; fi
+    mv "$DESKTOP_DATA" "$dst"
+  fi
+  src="$PROFILES/$new/desktop"
+  mkdir -p "$PROFILES/$new"
+  if [ -d "$src" ]; then mv "$src" "$DESKTOP_DATA"; fi
+  # keep MCP servers / settings identical across accounts
+  if [ "${CLAUDE_PET_SHARE_DESKTOP_CONFIG:-1}" = 1 ] && [ -f "$OS_HOME/shared_desktop_config.json" ]; then
+    mkdir -p "$DESKTOP_DATA"
+    cp "$OS_HOME/shared_desktop_config.json" "$DESKTOP_DATA/claude_desktop_config.json"
+  fi
+  set_state current.desktop "$new"
+  if [ $was_running = 1 ] || [ "${CLAUDE_PET_OPEN_DESKTOP:-0}" = 1 ]; then
+    open -a "$DESKTOP_APP" >/dev/null 2>&1 || log "couldn't relaunch $DESKTOP_APP"
+  fi
+}
+
+# ---------- commands ----------
+switch_to() {   # target mode(use|new)
+  local target="$1" mode="$2" cur c
+  cur=$(get_state current)
+  [ -n "$cur" ] || die "not set up yet — run: claude-pet init <name-for-the-account-you're-logged-into-now>"
+  mkdir -p "$PROFILES/$target"
+
+  if has_surface cli; then
+    c=$(get_state current.cli)
+    if [ "$c" != "$target" ]; then
+      if [ -n "$c" ]; then cli_snapshot "$c"; fi
+      cli_activate "$target"
+      log "✓ Claude Code → $target  (restart running claude sessions)"
+    fi
+  fi
+  if has_surface desktop; then
+    c=$(get_state current.desktop)
+    if [ "$c" != "$target" ]; then
+      desktop_activate "$target"
+      log "✓ Claude desktop → $target"
+    fi
+  fi
+  set_state current "$target"
+  if [ "$mode" = new ]; then log "Now log in to '$target' in each app — Claude Pet saves it automatically when you switch away."; fi
+}
+
+cmd_init() {
+  local name="${1:-}" cur
+  valid_name "$name" || die "pick a short name: letters, digits, . _ - (up to 10)"
+  cur=$(get_state current)
+  [ -z "$cur" ] || [ "$cur" = "$name" ] || die "already set up (current account: $cur)"
+  mkdir -p "$PROFILES/$name"
+  set_state current "$name"
+  set_state current.cli "$name"
+  set_state current.desktop "$name"
+  cli_snapshot "$name"
+  log "✓ Your current logins are now saved as '$name'. Add another with: claude-pet add <name>"
+}
+
+cmd_add() {
+  local name="${1:-}"
+  valid_name "$name" || die "pick a short name: letters, digits, . _ - (up to 10)"
+  if profile_exists "$name"; then die "'$name' already exists"; fi
+  switch_to "$name" new
+}
+
+cmd_use() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: claude-pet use <name>"
+  profile_exists "$name" || die "no account called '$name' (see: claude-pet list)"
+  switch_to "$name" use
+}
+
+cmd_next() {
+  local cur first="" next="" found=0 n
+  cur=$(get_state current)
+  [ -n "$cur" ] || die "not set up yet — run: claude-pet init <name>"
+  for n in $(list_profiles); do
+    if [ -z "$first" ]; then first="$n"; fi
+    if [ $found = 1 ] && [ -z "$next" ]; then next="$n"; fi
+    if [ "$n" = "$cur" ]; then found=1; fi
+  done
+  [ -n "$next" ] || next="$first"
+  [ "$next" != "$cur" ] || die "only one account — add another with: claude-pet add <name>"
+  switch_to "$next" use
+}
+
+account_email() {   # Claude Code's saved login first, else the desktop app's cached account
+  local n="$1" email dir saved="$PROFILES/$1/email" known=""
+  if [ -f "$saved" ]; then known=$(cat "$saved"); fi
+  email=$(json_op email "$PROFILES/$n/cli/account.json" 2>/dev/null || true)
+  if [ -z "$email" ]; then
+    # the desktop cache is only re-read for the live app, or when nothing is saved yet
+    if [ "$(get_state current.desktop)" = "$n" ]; then dir="$DESKTOP_DATA"; else dir="$PROFILES/$n/desktop"; fi
+    if [ -d "$dir/IndexedDB" ] && { [ -z "$known" ] || [ "$dir" = "$DESKTOP_DATA" ]; }; then
+      email=$(json_op desktopemail "$dir" 2>/dev/null || true)
+    fi
+  fi
+  # remember it with the profile, so it stays even if the app's cache goes away
+  if [ -n "$email" ] && [ "$email" != "$known" ]; then
+    { printf '%s\n' "$email" > "$saved"; } 2>/dev/null || true
+  fi
+  printf '%s' "${email:-$known}"
+}
+
+cmd_list() {
+  local cur n mark email
+  cur=$(get_state current)
+  for n in $(list_profiles); do
+    email=$(account_email "$n")
+    if [ "${1:-}" = "--porcelain" ]; then
+      if [ "$n" = "$cur" ]; then mark=1; else mark=0; fi
+      printf '%s\t%s\t%s\n' "$mark" "$n" "$email"
+    else
+      if [ "$n" = "$cur" ]; then mark="*"; else mark=" "; fi
+      if [ -n "$email" ]; then printf '%s %s  (%s)\n' "$mark" "$n" "$email"; else printf '%s %s\n' "$mark" "$n"; fi
+    fi
+  done
+}
+
+surface_label() { case "$1" in cli) echo "Claude Code" ;; desktop) echo "the Claude desktop app" ;; *) echo "$1" ;; esac; }
+
+cmd_remove() {
+  local name="${1:-}" s n cur other=""
+  case "$name" in ''|.*|*/*) die "usage: claude-pet remove <name>" ;; esac
+  profile_exists "$name" || die "no account called '$name'"
+  cur=$(get_state current)
+  for n in $(list_profiles); do
+    if [ "$n" != "$name" ] && [ -z "$other" ]; then other="$n"; fi
+  done
+  if [ -n "$other" ]; then
+    # still signed in somewhere: move those apps to another account first
+    for s in cli desktop; do
+      if [ "$(get_state current.$s)" = "$name" ] && ! has_surface $s; then
+        die "'$name' is still signed in to $(surface_label $s), which is turned off — turn it on and try again"
+      fi
+    done
+    if [ "$cur" = "$name" ]; then
+      switch_to "$other" use
+    elif [ "$(get_state current.cli)" = "$name" ] || [ "$(get_state current.desktop)" = "$name" ]; then
+      switch_to "$cur" use
+    fi
+  fi
+  # Whatever still points at it (everything, when it's the last account) is forgotten. The apps
+  # stay logged in as they are.
+  for s in current current.cli current.desktop; do
+    if [ "$(get_state $s)" = "$name" ]; then rm -f "$OS_HOME/$s"; fi
+  done
+  rm -rf "$PROFILES/$name"
+  kc_delete "$KC_PREFIX$name"
+  log "✓ removed '$name'"
+}
+
+cmd_rename() {
+  local old="${1:-}" new="${2:-}" s creds
+  [ -n "$old" ] && [ -n "$new" ] || die "usage: claude-pet rename <old> <new>"
+  profile_exists "$old" || die "no account called '$old'"
+  valid_name "$new" || die "pick a short name: letters, digits, . _ - (up to 10)"
+  if profile_exists "$new"; then die "'$new' already exists"; fi
+  mv "$PROFILES/$old" "$PROFILES/$new"
+  if creds=$(kc_read "$KC_PREFIX$old"); then
+    kc_write "$KC_PREFIX$new" "claude-pet" "$creds"
+    kc_delete "$KC_PREFIX$old"
+  fi
+  for s in current current.cli current.desktop; do
+    if [ "$(get_state $s)" = "$old" ]; then set_state $s "$new"; fi
+  done
+  log "✓ renamed '$old' to '$new'"
+}
+
+# ---------- desktop pet ----------
+resolve_self() {
+  local p="$0" t
+  while [ -L "$p" ]; do
+    t=$(readlink "$p")
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+  done
+  printf '%s/%s\n' "$(cd "$(dirname "$p")" && pwd)" "$(basename "$p")"
+}
+
+cmd_install_pet() {
+  local self src app bin
+  self=$(resolve_self)
+  src="$(cd "$(dirname "$self")/.." && pwd)"
+  [ -f "$src/pet/ClaudePet.swift" ] || die "can't find the pet source next to $self"
+  command -v swiftc >/dev/null 2>&1 || die "building the pet needs Apple's command line tools — run: xcode-select --install"
+  app="$HOME/Applications/Claude Pet.app"
+  log "Building Claude Pet…"
+  # build first, so a failed build leaves the pet that's already there untouched
+  bin=$(mktemp -t ClaudePet)
+  swiftc -swift-version 5 -O "$src/pet/ClaudePet.swift" -framework AppKit -o "$bin" \
+    || { rm -f "$bin"; die "build failed — copy the error above and ask Claude to fix it"; }
+  # -a: also when the pet itself started this (its update button); pkill skips its ancestors otherwise
+  pkill -a -x ClaudePet >/dev/null 2>&1 || true
+  rm -rf "$app"
+  mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+  mv "$bin" "$app/Contents/MacOS/ClaudePet"
+  chmod 755 "$app/Contents/MacOS/ClaudePet"
+  cp "$src/pet/Info.plist" "$app/Contents/Info.plist"
+  cp "$self" "$app/Contents/Resources/claude-pet"
+  chmod +x "$app/Contents/Resources/claude-pet"
+  codesign --force --deep -s - "$app" >/dev/null 2>&1 || true
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$app/Contents/Resources/claude-pet" "$HOME/.local/bin/claude-pet"
+  open "$app"
+  log "✓ Claude Pet is on your desktop ($app)"
+  log "✓ Terminal command linked at ~/.local/bin/claude-pet"
+  log "  claude.ai in Chrome: Claude Pet for Chrome is coming soon"
+}
+
+# Update to the latest release and rebuild the pet (the pet runs this from its update button).
+# Through Claude Code when the plugin is installed, so its skills update too; otherwise straight
+# from GitHub. Profiles and settings are untouched.
+cmd_self_update() {
+  local cache="$HOME/.claude/plugins/cache/geekyowls/claude-pet" cli="" c d tmp
+  for c in "$(command -v claude 2>/dev/null || true)" "$HOME/.local/bin/claude" "$HOME/.claude/local/claude" \
+           /opt/homebrew/bin/claude /usr/local/bin/claude; do
+    if [ -n "$c" ] && [ -x "$c" ]; then cli="$c"; break; fi
+  done
+  if [ -d "$cache" ] && [ -n "$cli" ]; then
+    log "Updating through Claude Code…"
+    "$cli" plugin marketplace update geekyowls || die "couldn't reach GitHub to update"
+    "$cli" plugin update claude-pet@geekyowls || true   # says so when it's already the latest
+    # the cache keeps a folder per version: build from the highest one
+    d=$(ls -1 "$cache" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
+    [ -n "$d" ] && [ -x "$cache/$d/bin/claude-pet" ] || die "couldn't find the updated plugin"
+    exec "$cache/$d/bin/claude-pet" install-pet
+  fi
+  log "Downloading the latest Claude Pet…"
+  tmp=$(mktemp -d -t claude-pet)
+  curl -fsSL "https://github.com/geekyowlshq/claude-pet/archive/refs/heads/main.tar.gz" | tar -xz -C "$tmp" \
+    || die "couldn't download the update"
+  [ -x "$tmp/claude-pet-main/plugin/bin/claude-pet" ] || die "the download didn't look right"
+  exec "$tmp/claude-pet-main/plugin/bin/claude-pet" install-pet
+}
+
+# ---------- main ----------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --only) [ $# -ge 2 ] || die "--only needs a list"; SURFACES=$(printf '%s' "$2" | tr ',' ' '); shift 2 ;;
+    --only=*) SURFACES=$(printf '%s' "${1#--only=}" | tr ',' ' '); shift ;;
+    -h|--help) usage; exit 0 ;;
+    --version) echo "$VERSION"; exit 0 ;;
+    *) break ;;
+  esac
+done
+if [ -z "$SURFACES" ]; then
+  if [ -f "$OS_HOME/surfaces" ]; then SURFACES=$(cat "$OS_HOME/surfaces"); else SURFACES="$ALL_SURFACES"; fi
+fi
+for s in $SURFACES; do
+  case " $ALL_SURFACES " in *" $s "*) ;; *) die "unknown surface '$s' (use: cli, desktop)" ;; esac
+done
+
+write_json_helper
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  init)    acquire_lock; cmd_init "$@" ;;
+  add)     acquire_lock; cmd_add "$@" ;;
+  use)     acquire_lock; cmd_use "$@" ;;
+  next)    acquire_lock; cmd_next ;;
+  remove|rm) acquire_lock; cmd_remove "$@" ;;
+  rename|mv) acquire_lock; cmd_rename "$@" ;;
+  list|ls) cmd_list "$@" ;;
+  current) get_state current ;;
+  install-pet) cmd_install_pet ;;
+  self-update) cmd_self_update ;;
+  ''|help) usage ;;
+  *) die "unknown command '$cmd' (see: claude-pet --help)" ;;
+esac
